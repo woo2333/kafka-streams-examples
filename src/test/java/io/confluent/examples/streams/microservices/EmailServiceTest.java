@@ -11,6 +11,8 @@ import org.junit.After;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.util.Collections;
+
 import static io.confluent.examples.streams.avro.microservices.OrderState.CREATED;
 import static io.confluent.examples.streams.avro.microservices.Product.UNDERPANTS;
 import static io.confluent.examples.streams.microservices.domain.Schemas.Topics;
@@ -44,10 +46,11 @@ public class EmailServiceTest extends MicroserviceTestUtils {
   public void shouldSendEmailWithValidContents() throws Exception {
 
     //Given one order, customer and payment
-    String orderId = id(0L);
-    Order order = new Order(orderId, 15L, CREATED, UNDERPANTS, 3, 5.00d);
-    Customer customer = new Customer(15L, "Franz", "Kafka", "frans@thedarkside.net", "oppression street, prague, cze");
-    Payment payment = new Payment("Payment:1234", orderId, "CZK", 1000.00d);
+    final String orderId = id(0L);
+    final Order order = new Order(orderId, 15L, CREATED, UNDERPANTS, 3, 5.00d);
+    final Customer customer =
+      new Customer(15L, "Franz", "Kafka", "frans@thedarkside.net", "oppression street, prague, cze");
+    final Payment payment = new Payment("Payment:1234", orderId, "CZK", 1000.00d);
 
     emailService = new EmailService(details -> {
       assertThat(details.customer).isEqualTo(customer);
@@ -56,14 +59,14 @@ public class EmailServiceTest extends MicroserviceTestUtils {
       complete = true;
     });
 
-    send(Topics.CUSTOMERS, new KeyValue<>(customer.getId(), customer));
-    send(Topics.ORDERS, new KeyValue<>(order.getId(), order));
-    send(Topics.PAYMENTS, new KeyValue<>(payment.getId(), payment));
+    send(Topics.CUSTOMERS, Collections.singleton(new KeyValue<>(customer.getId(), customer)));
+    send(Topics.ORDERS, Collections.singleton(new KeyValue<>(order.getId(), order)));
+    send(Topics.PAYMENTS, Collections.singleton(new KeyValue<>(payment.getId(), payment)));
 
     //When
     emailService.start(CLUSTER.bootstrapServers());
 
     //Then
-    TestUtils.waitForCondition(() -> complete, "Email was never sent.");
+    TestUtils.waitForCondition(() -> complete, 60000L, "Email was never sent.");
   }
 }

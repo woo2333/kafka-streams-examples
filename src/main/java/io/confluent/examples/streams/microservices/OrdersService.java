@@ -7,11 +7,14 @@ import io.confluent.examples.streams.interactivequeries.MetadataService;
 import io.confluent.examples.streams.microservices.domain.Schemas;
 import io.confluent.examples.streams.microservices.domain.beans.OrderBean;
 import io.confluent.examples.streams.microservices.util.Paths;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KafkaStreams.State;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.errors.InvalidStateStoreException;
 import org.apache.kafka.streams.kstream.KStreamBuilder;
@@ -103,20 +106,20 @@ public class OrdersService implements Service {
   private Server jettyServer;
   private String host;
   private int port;
-  private KafkaStreams streams;
+  private KafkaStreams streams = null;
   private MetadataService metadataService;
   private KafkaProducer<String, Order> producer;
 
   //In a real implementation we would need to (a) support outstanding requests for the same Id/filter from
   // different users and (b) periodically purge old entries from this map.
-  private Map<String, FilteredResponse> outstandingRequests = new ConcurrentHashMap<>();
+  private Map<String, FilteredResponse<String, Order>> outstandingRequests = new ConcurrentHashMap<>();
 
-  public OrdersService(String host, int port) {
+  public OrdersService(final String host, final int port) {
     this.host = host;
     this.port = port;
   }
 
-  public OrdersService(String host) {
+  public OrdersService(final String host) {
     this(host, 0);
   }
 
@@ -126,7 +129,7 @@ public class OrdersService implements Service {
    * fulfilled.
    */
   private KStreamBuilder createOrdersMaterializedView() {
-    KStreamBuilder builder = new KStreamBuilder();
+    final KStreamBuilder builder = new KStreamBuilder();
     builder.stream(ORDERS.keySerde(), ORDERS.valueSerde(), ORDERS.name())
         .groupByKey(ORDERS.keySerde(), ORDERS.valueSerde())
         .reduce((agg, newVal) -> newVal, ORDERS_STORE_NAME)
@@ -134,8 +137,8 @@ public class OrdersService implements Service {
     return builder;
   }
 
-  private void maybeCompleteLongPollGet(String id, Order order) {
-    FilteredResponse callback = outstandingRequests.get(id);
+  private void maybeCompleteLongPollGet(final String id, final Order order) {
+    final FilteredResponse<String, Order> callback = outstandingRequests.get(id);
     if (callback != null && callback.predicate.test(id, order)) {
       callback.asyncResponse.resume(toBean(order));
     }
@@ -157,11 +160,11 @@ public class OrdersService implements Service {
   @Path("/orders/{id}")
   @Produces({MediaType.APPLICATION_JSON, MediaType.TEXT_PLAIN})
   public void getWithTimeout(@PathParam("id") final String id,
-      @QueryParam("timeout") @DefaultValue(CALL_TIMEOUT) Long timeout,
+      @QueryParam("timeout") @DefaultValue(CALL_TIMEOUT) final Long timeout,
       @Suspended final AsyncResponse asyncResponse) {
     setTimeout(timeout, asyncResponse);
 
-    HostStoreInfo hostForKey = getKeyLocationOrBlock(id, asyncResponse);
+    final HostStoreInfo hostForKey = getKeyLocationOrBlock(id, asyncResponse);
 
     if (hostForKey == null) { //request timed out so return
       return;
@@ -170,16 +173,16 @@ public class OrdersService implements Service {
     if (thisHost(hostForKey)) {
       fetchLocal(id, asyncResponse, (k, v) -> true);
     } else {
-      String path = new Paths(hostForKey.getHost(), hostForKey.getPort()).urlGet(id);
+      final String path = new Paths(hostForKey.getHost(), hostForKey.getPort()).urlGet(id);
       fetchFromOtherHost(path, asyncResponse, timeout);
     }
   }
 
   class FilteredResponse<K, V> {
     private AsyncResponse asyncResponse;
-    private Predicate predicate;
+    private Predicate<K, V> predicate;
 
-    FilteredResponse(AsyncResponse asyncResponse, Predicate<K, V> predicate) {
+    FilteredResponse(final AsyncResponse asyncResponse, final Predicate<K, V> predicate) {
       this.asyncResponse = asyncResponse;
       this.predicate = predicate;
     }
@@ -193,19 +196,21 @@ public class OrdersService implements Service {
    * @param predicate a filter that for this fetch, so for example we might fetch only VALIDATED
    * orders.
    */
-  private void fetchLocal(String id, AsyncResponse asyncResponse, Predicate<String, Order> predicate) {
+  private void fetchLocal(final String id,
+                          final AsyncResponse asyncResponse,
+                          final Predicate<String, Order> predicate) {
     log.info("running GET on this node");
     try {
-      Order order = ordersStore().get(id);
+      final Order order = ordersStore().get(id);
       if (order == null || !predicate.test(id, order)) {
         log.info("Delaying get as order not present for id " + id);
-        outstandingRequests.put(id, new FilteredResponse(asyncResponse, predicate));
+        outstandingRequests.put(id, new FilteredResponse<>(asyncResponse, predicate));
       } else {
         asyncResponse.resume(toBean(order));
       }
-    } catch (InvalidStateStoreException e) {
+    } catch (final InvalidStateStoreException e) {
       //Store not ready so delay
-      outstandingRequests.put(id, new FilteredResponse(asyncResponse, predicate));
+      outstandingRequests.put(id, new FilteredResponse<>(asyncResponse, predicate));
     }
   }
 
@@ -220,7 +225,7 @@ public class OrdersService implements Service {
    * <p>
    * If metadata is available, which can happen on startup, or during a rebalance, block until it is.
    */
-  private HostStoreInfo getKeyLocationOrBlock(String id, AsyncResponse asyncResponse) {
+  private HostStoreInfo getKeyLocationOrBlock(final String id, final AsyncResponse asyncResponse) {
     HostStoreInfo locationOfKey;
     while (locationMetadataIsUnavailable(locationOfKey = getHostForOrderId(id))) {
       //The metastore is not available. This can happen on startup/rebalance.
@@ -231,14 +236,14 @@ public class OrdersService implements Service {
       try {
         //Sleep a bit until metadata becomes available
         Thread.sleep(Math.min(Long.valueOf(CALL_TIMEOUT), 200));
-      } catch (InterruptedException e) {
+      } catch (final InterruptedException e) {
         e.printStackTrace();
       }
     }
     return locationOfKey;
   }
 
-  private boolean locationMetadataIsUnavailable(HostStoreInfo hostWithKey) {
+  private boolean locationMetadataIsUnavailable(final HostStoreInfo hostWithKey) {
     return NOT_AVAILABLE.host().equals(hostWithKey.getHost())
         && NOT_AVAILABLE.port() == hostWithKey.getPort();
   }
@@ -248,16 +253,16 @@ public class OrdersService implements Service {
         host.getPort() == port;
   }
 
-  private void fetchFromOtherHost(final String path, AsyncResponse asyncResponse, long timeout) {
+  private void fetchFromOtherHost(final String path, final AsyncResponse asyncResponse, final long timeout) {
     log.info("Chaining GET to a different instance: " + path);
     try {
-      OrderBean bean = client.target(path)
+      final OrderBean bean = client.target(path)
           .queryParam("timeout", timeout)
           .request(MediaType.APPLICATION_JSON_TYPE)
           .get(new GenericType<OrderBean>() {
           });
       asyncResponse.resume(bean);
-    } catch (Exception swallowed) {
+    } catch (final Exception swallowed) {
     }
   }
 
@@ -265,11 +270,11 @@ public class OrdersService implements Service {
   @ManagedAsync
   @Path("orders/{id}/validated")
   public void getPostValidationWithTimeout(@PathParam("id") final String id,
-      @QueryParam("timeout") @DefaultValue(CALL_TIMEOUT) Long timeout,
+      @QueryParam("timeout") @DefaultValue(CALL_TIMEOUT) final Long timeout,
       @Suspended final AsyncResponse asyncResponse) {
     setTimeout(timeout, asyncResponse);
 
-    HostStoreInfo hostForKey = getKeyLocationOrBlock(id, asyncResponse);
+    final HostStoreInfo hostForKey = getKeyLocationOrBlock(id, asyncResponse);
 
     if (hostForKey == null) { //request timed out so return
       return;
@@ -301,13 +306,13 @@ public class OrdersService implements Service {
       @Suspended final AsyncResponse response) {
     setTimeout(timeout, response);
 
-    Order bean = fromBean(order);
+    final Order bean = fromBean(order);
     producer.send(new ProducerRecord<>(ORDERS.name(), bean.getId(), bean),
         callback(response, bean.getId()));
   }
 
   @Override
-  public void start(String bootstrapServers) {
+  public void start(final String bootstrapServers) {
     jettyServer = startJetty(port, this);
     port = jettyServer.getURI().getPort(); // update port, in case port was zero
     producer = startProducer(bootstrapServers, ORDER_VALIDATIONS);
@@ -315,17 +320,32 @@ public class OrdersService implements Service {
     log.info("Started Service " + getClass().getSimpleName());
   }
 
-  private KafkaStreams startKStreams(String bootstrapServers) {
-    KafkaStreams streams = new KafkaStreams(createOrdersMaterializedView(),
+  private KafkaStreams startKStreams(final String bootstrapServers) {
+    final KafkaStreams streams = new KafkaStreams(createOrdersMaterializedView(),
         config(bootstrapServers));
     metadataService = new MetadataService(streams);
     streams.cleanUp(); //don't do this in prod as it clears your state stores
+    final CountDownLatch startLatch = new CountDownLatch(1);
+    streams.setStateListener((newState, oldState) -> {
+      if (newState == State.RUNNING && oldState == State.REBALANCING) {
+        startLatch.countDown();
+      }
+
+    });
     streams.start();
+
+    try {
+      if (!startLatch.await(60, TimeUnit.SECONDS)) {
+        throw new RuntimeException("Streams never finished rebalancing on startup");
+      }
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
     return streams;
   }
 
-  private Properties config(String bootstrapServers) {
-    Properties props = baseStreamsConfig(bootstrapServers, "/tmp/kafka-streams", SERVICE_APP_ID);
+  private Properties config(final String bootstrapServers) {
+    final Properties props = baseStreamsConfig(bootstrapServers, "/tmp/kafka-streams", SERVICE_APP_ID);
     props.put(StreamsConfig.APPLICATION_SERVER_CONFIG, host + ":" + port);
     return props;
   }
@@ -341,9 +361,16 @@ public class OrdersService implements Service {
     if (jettyServer != null) {
       try {
         jettyServer.stop();
-      } catch (Exception e) {
+      } catch (final Exception e) {
         e.printStackTrace();
       }
+    }
+  }
+
+  // for testing only
+  void cleanLocalState() {
+    if (streams != null) {
+      streams.cleanUp();
     }
   }
 
@@ -351,7 +378,7 @@ public class OrdersService implements Service {
     return port;
   }
 
-  private HostStoreInfo getHostForOrderId(String orderId) {
+  private HostStoreInfo getHostForOrderId(final String orderId) {
     return metadataService
         .streamsMetadataForStoreAndKey(ORDERS_STORE_NAME, orderId, Serdes.String().serializer());
   }
@@ -363,16 +390,16 @@ public class OrdersService implements Service {
       } else {
         try {
           //Return the location of the newly created resource
-          Response uri = Response.created(new URI("/v1/orders/" + orderId)).build();
+          final Response uri = Response.created(new URI("/v1/orders/" + orderId)).build();
           response.resume(uri);
-        } catch (URISyntaxException e2) {
+        } catch (final URISyntaxException e2) {
           e2.printStackTrace();
         }
       }
     };
   }
 
-  public static void main(String[] args) throws Exception {
+  public static void main(final String[] args) throws Exception {
 
     final String bootstrapServers = args.length > 1 ? args[1] : "localhost:9092";
     final String schemaRegistryUrl = args.length > 2 ? args[2] : "http://localhost:8081";
@@ -380,7 +407,7 @@ public class OrdersService implements Service {
     final String restPort = args.length > 4 ? args[4] : null;
 
     Schemas.configureSerdesWithSchemaRegistryUrl(schemaRegistryUrl);
-    OrdersService service = new OrdersService(restHostname, restPort == null ? 0 : Integer.valueOf(restPort));
+    final OrdersService service = new OrdersService(restHostname, restPort == null ? 0 : Integer.valueOf(restPort));
     service.start(bootstrapServers);
     addShutdownHookAndBlock(service);
   }

@@ -18,13 +18,22 @@ package io.confluent.examples.streams.kafka;
 import io.confluent.examples.streams.zookeeper.ZooKeeperEmbedded;
 import io.confluent.kafka.schemaregistry.RestApp;
 import io.confluent.kafka.schemaregistry.avro.AvroCompatibilityLevel;
+import io.confluent.kafka.schemaregistry.rest.SchemaRegistryConfig;
 import kafka.server.KafkaConfig$;
+import kafka.utils.ZkUtils;
+import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.security.JaasUtils;
+import org.apache.kafka.test.TestCondition;
+import org.apache.kafka.test.TestUtils;
 import org.junit.rules.ExternalResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Runs an in-memory, "embedded" Kafka cluster with 1 ZooKeeper instance, 1 Kafka broker, and 1
@@ -37,7 +46,12 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
   private static final String KAFKA_SCHEMAS_TOPIC = "_schemas";
   private static final String AVRO_COMPATIBILITY_TYPE = AvroCompatibilityLevel.NONE.name;
 
+  private static final String KAFKASTORE_OPERATION_TIMEOUT_MS = "60000";
+  private static final String KAFKASTORE_DEBUG = "true";
+  private static final String KAFKASTORE_INIT_TIMEOUT = "90000";
+
   private ZooKeeperEmbedded zookeeper;
+  private ZkUtils zkUtils = null;
   private KafkaEmbedded broker;
   private RestApp schemaRegistry;
   private final Properties brokerConfig;
@@ -55,8 +69,9 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
    *
    * @param brokerConfig Additional broker configuration settings.
    */
-  public EmbeddedSingleNodeKafkaCluster(Properties brokerConfig) {
+  public EmbeddedSingleNodeKafkaCluster(final Properties brokerConfig) {
     this.brokerConfig = new Properties();
+    this.brokerConfig.put(SchemaRegistryConfig.KAFKASTORE_TIMEOUT_CONFIG, KAFKASTORE_OPERATION_TIMEOUT_MS);
     this.brokerConfig.putAll(brokerConfig);
   }
 
@@ -69,24 +84,36 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
     zookeeper = new ZooKeeperEmbedded();
     log.debug("ZooKeeper instance is running at {}", zookeeper.connectString());
 
-    Properties effectiveBrokerConfig = effectiveBrokerConfigFrom(brokerConfig, zookeeper);
+    zkUtils = ZkUtils.apply(
+        zookeeper.connectString(),
+        30000,
+        30000,
+        JaasUtils.isZkSecurityEnabled());
+
+    final Properties effectiveBrokerConfig = effectiveBrokerConfigFrom(brokerConfig, zookeeper);
     log.debug("Starting a Kafka instance on port {} ...",
         effectiveBrokerConfig.getProperty(KafkaConfig$.MODULE$.PortProp()));
     broker = new KafkaEmbedded(effectiveBrokerConfig);
     log.debug("Kafka instance is running at {}, connected to ZooKeeper at {}",
         broker.brokerList(), broker.zookeeperConnect());
 
-    schemaRegistry = new RestApp(0, zookeeperConnect(), KAFKA_SCHEMAS_TOPIC, AVRO_COMPATIBILITY_TYPE, new Properties());
+    final Properties schemaRegistryProps = new Properties();
+
+    schemaRegistryProps.put(SchemaRegistryConfig.KAFKASTORE_TIMEOUT_CONFIG, KAFKASTORE_OPERATION_TIMEOUT_MS);
+    schemaRegistryProps.put(SchemaRegistryConfig.DEBUG_CONFIG, KAFKASTORE_DEBUG);
+    schemaRegistryProps.put(SchemaRegistryConfig.KAFKASTORE_INIT_TIMEOUT_CONFIG, KAFKASTORE_INIT_TIMEOUT);
+
+    schemaRegistry = new RestApp(0, zookeeperConnect(), KAFKA_SCHEMAS_TOPIC, AVRO_COMPATIBILITY_TYPE, schemaRegistryProps);
     schemaRegistry.start();
     running = true;
   }
 
-  private Properties effectiveBrokerConfigFrom(Properties brokerConfig, ZooKeeperEmbedded zookeeper) {
-    Properties effectiveConfig = new Properties();
+  private Properties effectiveBrokerConfigFrom(final Properties brokerConfig, final ZooKeeperEmbedded zookeeper) {
+    final Properties effectiveConfig = new Properties();
     effectiveConfig.putAll(brokerConfig);
     effectiveConfig.put(KafkaConfig$.MODULE$.ZkConnectProp(), zookeeper.connectString());
     effectiveConfig.put(KafkaConfig$.MODULE$.PortProp(), DEFAULT_BROKER_PORT);
-
+    effectiveConfig.put(KafkaConfig$.MODULE$.ZkConnectionTimeoutMsProp(), 60 * 1000);
     effectiveConfig.put(KafkaConfig$.MODULE$.DeleteTopicEnableProp(), true);
     effectiveConfig.put(KafkaConfig$.MODULE$.LogCleanerDedupeBufferSizeProp(), 2 * 1024 * 1024L);
     effectiveConfig.put(KafkaConfig$.MODULE$.GroupMinSessionTimeoutMsProp(), 0);
@@ -115,7 +142,7 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
         if (schemaRegistry != null) {
           schemaRegistry.stop();
         }
-      } catch (Exception e) {
+      } catch (final Exception e) {
         throw new RuntimeException(e);
       }
       if (broker != null) {
@@ -125,7 +152,7 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
         if (zookeeper != null) {
           zookeeper.stop();
         }
-      } catch (IOException e) {
+      } catch (final IOException e) {
         throw new RuntimeException(e);
       }
     } finally {
@@ -167,7 +194,7 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
    *
    * @param topic The name of the topic.
    */
-  public void createTopic(String topic) {
+  public void createTopic(final String topic) {
     createTopic(topic, 1, 1, new Properties());
   }
 
@@ -178,7 +205,7 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
    * @param partitions  The number of partitions for this topic.
    * @param replication The replication factor for (the partitions of) this topic.
    */
-  public void createTopic(String topic, int partitions, int replication) {
+  public void createTopic(final String topic, final int partitions, final int replication) {
     createTopic(topic, partitions, replication, new Properties());
   }
 
@@ -190,14 +217,47 @@ public class EmbeddedSingleNodeKafkaCluster extends ExternalResource {
    * @param replication The replication factor for (partitions of) this topic.
    * @param topicConfig Additional topic-level configuration settings.
    */
-  public void createTopic(String topic,
-                          int partitions,
-                          int replication,
-                          Properties topicConfig) {
+  public void createTopic(final String topic,
+                          final int partitions,
+                          final int replication,
+                          final Properties topicConfig) {
     broker.createTopic(topic, partitions, replication, topicConfig);
+  }
+
+  /**
+   * Deletes multiple topics and blocks until all topics got deleted.
+   *
+   * @param timeoutMs the max time to wait for the topics to be deleted (does not block if {@code <= 0})
+   * @param topics the name of the topics
+   */
+  public void deleteTopicsAndWait(final long timeoutMs, final String... topics) throws InterruptedException {
+    for (final String topic : topics) {
+      try {
+        broker.deleteTopic(topic);
+      } catch (final UnknownTopicOrPartitionException e) { }
+    }
+
+    if (timeoutMs > 0) {
+      TestUtils.waitForCondition(new TopicsDeletedCondition(topics), timeoutMs, "Topics not deleted after " + timeoutMs + " milli seconds.");
+    }
   }
 
   public boolean isRunning() {
     return running;
   }
+
+  private final class TopicsDeletedCondition implements TestCondition {
+    final Set<String> deletedTopics = new HashSet<>();
+
+    private TopicsDeletedCondition(final String... topics) {
+      Collections.addAll(deletedTopics, topics);
+    }
+
+    @Override
+    public boolean conditionMet() {
+      final Set<String> allTopics = new HashSet<>(scala.collection.JavaConversions.seqAsJavaList(zkUtils.getAllTopics()));
+      return !allTopics.removeAll(deletedTopics);
+    }
+  }
+
 }

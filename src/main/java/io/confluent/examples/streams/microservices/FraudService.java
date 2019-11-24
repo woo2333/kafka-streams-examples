@@ -5,10 +5,14 @@ import io.confluent.examples.streams.avro.microservices.OrderState;
 import io.confluent.examples.streams.avro.microservices.OrderValidation;
 import io.confluent.examples.streams.avro.microservices.OrderValue;
 import io.confluent.examples.streams.microservices.domain.Schemas;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.Consumed;
 import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
+import org.apache.kafka.streams.KafkaStreams.State;
+
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
@@ -47,24 +51,40 @@ public class FraudService implements Service {
   private KafkaStreams streams;
 
   @Override
-  public void start(String bootstrapServers) {
+  public void start(final String bootstrapServers) {
     streams = processStreams(bootstrapServers, "/tmp/kafka-streams");
     streams.cleanUp(); //don't do this in prod as it clears your state stores
+    final CountDownLatch startLatch = new CountDownLatch(1);
+    streams.setStateListener((newState, oldState) -> {
+      if (newState == State.RUNNING && oldState == State.REBALANCING) {
+        startLatch.countDown();
+      }
+
+    });
     streams.start();
+
+    try {
+      if (!startLatch.await(60, TimeUnit.SECONDS)) {
+        throw new RuntimeException("Streams never finished rebalancing on startup");
+      }
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+
     log.info("Started Service " + getClass().getSimpleName());
   }
 
   private KafkaStreams processStreams(final String bootstrapServers, final String stateDir) {
 
     //Latch onto instances of the orders and inventory topics
-    StreamsBuilder builder = new StreamsBuilder();
-    KStream<String, Order> orders = builder
+    final StreamsBuilder builder = new StreamsBuilder();
+    final KStream<String, Order> orders = builder
         .stream(ORDERS.name(), Consumed.with(ORDERS.keySerde(), ORDERS.valueSerde()))
         .filter((id, order) -> OrderState.CREATED.equals(order.getState()));
 
     //Create an aggregate of the total value by customer and hold it with the order. We use session windows to
     // detect periods of activity.
-    KTable<Windowed<Long>, OrderValue> aggregate = orders
+    final KTable<Windowed<Long>, OrderValue> aggregate = orders
         .groupBy((id, order) -> order.getCustomerId(), Serialized.with(Serdes.Long(), ORDERS.valueSerde()))
         .windowedBy(SessionWindows.with(60 * MIN))
         .aggregate(OrderValue::new,
@@ -75,13 +95,13 @@ public class FraudService implements Service {
             Materialized.with(null, Schemas.ORDER_VALUE_SERDE));
 
     //Ditch the windowing and rekey
-    KStream<String, OrderValue> ordersWithTotals = aggregate
+    final KStream<String, OrderValue> ordersWithTotals = aggregate
         .toStream((windowedKey, orderValue) -> windowedKey.key())
         .filter((k, v) -> v != null)//When elements are evicted from a session window they create delete events. Filter these out.
         .selectKey((id, orderValue) -> orderValue.getOrder().getId());
 
     //Now branch the stream into two, for pass and fail, based on whether the windowed total is over Fraud Limit
-    KStream<String, OrderValue>[] forks = ordersWithTotals.branch(
+    final KStream<String, OrderValue>[] forks = ordersWithTotals.branch(
         (id, orderValue) -> orderValue.getValue() >= FRAUD_LIMIT,
         (id, orderValue) -> orderValue.getValue() < FRAUD_LIMIT);
 
@@ -99,18 +119,18 @@ public class FraudService implements Service {
     //as caching in Kafka Streams will conflate subsequent updates for the same key. Disabling caching ensures
     //we get a complete "changelog" from the aggregate(...) step above (i.e. every input event will have a
     //corresponding output event.
-    Properties props = baseStreamsConfig(bootstrapServers, stateDir, FRAUD_SERVICE_APP_ID);
+    final Properties props = baseStreamsConfig(bootstrapServers, stateDir, FRAUD_SERVICE_APP_ID);
     props.setProperty(StreamsConfig.CACHE_MAX_BYTES_BUFFERING_CONFIG, "0");
 
     return new KafkaStreams(builder.build(), props);
   }
 
-  private OrderValue simpleMerge(OrderValue a, OrderValue b) {
+  private OrderValue simpleMerge(final OrderValue a, final OrderValue b) {
     return new OrderValue(b.getOrder(), (a == null ? 0D : a.getValue()) + b.getValue());
   }
 
-  public static void main(String[] args) throws Exception {
-    FraudService service = new FraudService();
+  public static void main(final String[] args) throws Exception {
+    final FraudService service = new FraudService();
     service.start(parseArgsAndConfigure(args));
     addShutdownHookAndBlock(service);
   }

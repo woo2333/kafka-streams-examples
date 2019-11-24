@@ -10,6 +10,7 @@ import io.confluent.examples.streams.avro.microservices.OrderValue;
 import io.confluent.examples.streams.avro.microservices.Payment;
 import io.confluent.examples.streams.avro.microservices.Product;
 import io.confluent.kafka.streams.serdes.avro.SpecificAvroSerde;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -27,11 +28,11 @@ public class Schemas {
 
   public static class Topic<K, V> {
 
-    private String name;
-    private Serde<K> keySerde;
-    private Serde<V> valueSerde;
+    private final String name;
+    private final Serde<K> keySerde;
+    private final Serde<V> valueSerde;
 
-    Topic(String name, Serde<K> keySerde, Serde<V> valueSerde) {
+    Topic(final String name, final Serde<K> keySerde, final Serde<V> valueSerde) {
       this.name = name;
       this.keySerde = keySerde;
       this.valueSerde = valueSerde;
@@ -72,17 +73,15 @@ public class Schemas {
       ORDERS = new Topic<>("orders", Serdes.String(), new SpecificAvroSerde<Order>());
       PAYMENTS = new Topic<>("payments", Serdes.String(), new SpecificAvroSerde<Payment>());
       CUSTOMERS = new Topic<>("customers", Serdes.Long(), new SpecificAvroSerde<Customer>());
-      ORDER_VALIDATIONS = new Topic<>("order-validations", Serdes.String(),
-          new SpecificAvroSerde<OrderValidation>());
-      WAREHOUSE_INVENTORY = new Topic<>("warehouse-inventory", new ProductTypeSerde(),
-          Serdes.Integer());
+      ORDER_VALIDATIONS = new Topic<>("order-validations", Serdes.String(), new SpecificAvroSerde<OrderValidation>());
+      WAREHOUSE_INVENTORY = new Topic<>("warehouse-inventory", new ProductTypeSerde(), Serdes.Integer());
       ORDER_VALUE_SERDE = new SpecificAvroSerde<>();
     }
   }
 
-  public static void configureSerdesWithSchemaRegistryUrl(String url) {
+  public static void configureSerdesWithSchemaRegistryUrl(final String url) {
     Topics.createTopics(); //wipe cached schema registry
-    for (Topic topic : Topics.ALL.values()) {
+    for (final Topic topic : Topics.ALL.values()) {
       configure(topic.keySerde(), url);
       configure(topic.valueSerde(), url);
     }
@@ -90,7 +89,7 @@ public class Schemas {
     schemaRegistryUrl = url;
   }
 
-  private static void configure(Serde serde, String url) {
+  private static void configure(final Serde serde, final String url) {
     if (serde instanceof SpecificAvroSerde) {
       serde.configure(Collections.singletonMap(SCHEMA_REGISTRY_URL_CONFIG, url), false);
     }

@@ -12,10 +12,15 @@ import io.confluent.examples.streams.avro.microservices.OrderValidation;
 import io.confluent.examples.streams.avro.microservices.Product;
 import io.confluent.examples.streams.microservices.domain.Schemas.Topics;
 import io.confluent.examples.streams.microservices.util.MicroserviceUtils;
+
 import java.util.HashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.Consumed;
 import org.apache.kafka.streams.KafkaStreams;
+import org.apache.kafka.streams.KafkaStreams.State;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.kstream.Joined;
@@ -48,10 +53,25 @@ public class InventoryService implements Service {
   private KafkaStreams streams;
 
   @Override
-  public void start(String bootstrapServers) {
+  public void start(final String bootstrapServers) {
     streams = processStreams(bootstrapServers, "/tmp/kafka-streams");
     streams.cleanUp(); //don't do this in prod as it clears your state stores
+    final CountDownLatch startLatch = new CountDownLatch(1);
+    streams.setStateListener((newState, oldState) -> {
+      if (newState == State.RUNNING && oldState == State.REBALANCING) {
+        startLatch.countDown();
+      }
+
+    });
     streams.start();
+
+    try {
+      if (!startLatch.await(60, TimeUnit.SECONDS)) {
+        throw new RuntimeException("Streams never finished rebalancing on startup");
+      }
+    } catch (final InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
     log.info("Started Service " + getClass().getSimpleName());
   }
 
@@ -65,17 +85,17 @@ public class InventoryService implements Service {
   private KafkaStreams processStreams(final String bootstrapServers, final String stateDir) {
 
     //Latch onto instances of the orders and inventory topics
-    StreamsBuilder builder = new StreamsBuilder();
-    KStream<String, Order> orders = builder
+    final StreamsBuilder builder = new StreamsBuilder();
+    final KStream<String, Order> orders = builder
         .stream(Topics.ORDERS.name(),
             Consumed.with(Topics.ORDERS.keySerde(), Topics.ORDERS.valueSerde()));
-    KTable<Product, Integer> warehouseInventory = builder
+    final KTable<Product, Integer> warehouseInventory = builder
         .table(Topics.WAREHOUSE_INVENTORY.name(), Consumed
             .with(Topics.WAREHOUSE_INVENTORY.keySerde(), Topics.WAREHOUSE_INVENTORY.valueSerde()));
 
     //Create a store to reserve inventory whilst the order is processed.
     //This will be prepopulated from Kafka before the service starts processing
-    StoreBuilder reservedStock = Stores
+    final StoreBuilder reservedStock = Stores
         .keyValueStoreBuilder(Stores.persistentKeyValueStore(RESERVED_STOCK_STORE_NAME),
             Topics.WAREHOUSE_INVENTORY.keySerde(), Serdes.Long())
         .withLoggingEnabled(new HashMap<>());
@@ -105,7 +125,7 @@ public class InventoryService implements Service {
 
     @Override
     @SuppressWarnings("unchecked")
-    public void init(ProcessorContext context) {
+    public void init(final ProcessorContext context) {
       reservedStocksStore = (KeyValueStore<Product, Long>) context
           .getStateStore(RESERVED_STOCK_STORE_NAME);
     }
@@ -114,9 +134,9 @@ public class InventoryService implements Service {
     public KeyValue<String, OrderValidation> transform(final Product productId,
         final KeyValue<Order, Integer> orderAndStock) {
       //Process each order/inventory pair one at a time
-      OrderValidation validated;
-      Order order = orderAndStock.key;
-      Integer warehouseStockCount = orderAndStock.value;
+      final OrderValidation validated;
+      final Order order = orderAndStock.key;
+      final Integer warehouseStockCount = orderAndStock.value;
 
       //Look up locally 'reserved' stock from our state store
       Long reserved = reservedStocksStore.get(order.getProduct());
@@ -138,7 +158,7 @@ public class InventoryService implements Service {
     }
 
     @Override
-    public KeyValue<String, OrderValidation> punctuate(long timestamp) {
+    public KeyValue<String, OrderValidation> punctuate(final long timestamp) {
       return null;
     }
 
@@ -147,8 +167,8 @@ public class InventoryService implements Service {
     }
   }
 
-  public static void main(String[] args) throws Exception {
-    InventoryService service = new InventoryService();
+  public static void main(final String[] args) throws Exception {
+    final InventoryService service = new InventoryService();
     service.start(parseArgsAndConfigure(args));
     addShutdownHookAndBlock(service);
   }
